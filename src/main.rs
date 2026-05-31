@@ -154,7 +154,7 @@ const FLEX_RCORE: &[u8] = b"CGGG";   // right arm core
 const FLEX_LCORE_M: &[u8] = b"CCCG"; // revcomp(CGGG): left anchor of a - strand box on the fwd seq
 const FLEX_RCORE_M: &[u8] = b"CGAA"; // revcomp(TTCG): right anchor of a - strand box
 
-struct FlexCfg { name: String, e: u32, smin: usize, smax: usize }
+struct FlexCfg { name: String, e: u32, smin: usize, smax: usize, max_arm_hd: u32 }
 
 #[inline]
 fn hamm4(w: &[u8], exp: &[u8]) -> u32 {
@@ -163,14 +163,16 @@ fn hamm4(w: &[u8], exp: &[u8]) -> u32 {
     h
 }
 
-/// Format one flex hit (forward box bytes `win`); None if it spans a non-ACGT base.
-fn flex_emit(name: &str, chrom: &str, start: usize, end: usize, plus: bool, win: &[u8]) -> Option<String> {
+/// Format one flex hit (forward box bytes `win`); None if it spans a non-ACGT base
+/// or its total arm Hamming exceeds `max_arm_hd`.
+fn flex_emit(name: &str, chrom: &str, start: usize, end: usize, plus: bool, win: &[u8], max_arm_hd: u32) -> Option<String> {
     let canon: Vec<u8> = if plus { win.iter().map(|b| b.to_ascii_uppercase()).collect() } else { revcomp(win) };
     let l = canon.len();
     if l < 8 { return None; }
     if canon.iter().any(|b| genome_mask(*b) == 0) { return None; } // no box across a gap/N
     let lh = hamm4(&canon[0..4], FLEX_LCORE);
     let rh = hamm4(&canon[l - 4..l], FLEX_RCORE);
+    if lh + rh > max_arm_hd { return None; } // total-arm-error cap
     let spacer_len = l - 8;
     let larm = String::from_utf8_lossy(&canon[0..4]);
     let rarm = String::from_utf8_lossy(&canon[l - 4..l]);
@@ -196,7 +198,7 @@ fn flex_scan_record(rec: &Record, cfg: &FlexCfg, out: &mut String) -> (u64, u64)
                 let j = i + 4 + gap;
                 if j + 4 > n { break; }
                 if hamm4(&s[j..j + 4], FLEX_RCORE) <= cfg.e {
-                    if let Some(line) = flex_emit(&cfg.name, &rec.name, i, j + 4, true, &s[i..j + 4]) {
+                    if let Some(line) = flex_emit(&cfg.name, &rec.name, i, j + 4, true, &s[i..j + 4], cfg.max_arm_hd) {
                         out.push_str(&line); out.push('\n'); fwd += 1;
                     }
                 }
@@ -208,7 +210,7 @@ fn flex_scan_record(rec: &Record, cfg: &FlexCfg, out: &mut String) -> (u64, u64)
                 let j = i + 4 + gap;
                 if j + 4 > n { break; }
                 if hamm4(&s[j..j + 4], FLEX_RCORE_M) <= cfg.e {
-                    if let Some(line) = flex_emit(&cfg.name, &rec.name, i, j + 4, false, &s[i..j + 4]) {
+                    if let Some(line) = flex_emit(&cfg.name, &rec.name, i, j + 4, false, &s[i..j + 4], cfg.max_arm_hd) {
                         out.push_str(&line); out.push('\n'); rev += 1;
                     }
                 }
@@ -223,8 +225,8 @@ fn run_flex(fasta: &str, cfg: FlexCfg, threads: usize, header: bool) {
     let recs = Arc::new(read_fasta(fasta).unwrap_or_else(|e| { eprintln!("read error: {e}"); std::process::exit(1); }));
     let n = recs.len();
     let nthreads = threads.max(1).min(n.max(1));
-    eprintln!("loaded {} records ({} bp); cenpb-flex arm-tol={} spacer={}-{} on {} threads",
-        n, recs.iter().map(|r| r.seq.len()).sum::<usize>(), cfg.e, cfg.smin, cfg.smax, nthreads);
+    eprintln!("loaded {} records ({} bp); cenpb-flex arm-tol={} max-arm-hd={} spacer={}-{} on {} threads",
+        n, recs.iter().map(|r| r.seq.len()).sum::<usize>(), cfg.e, cfg.max_arm_hd, cfg.smin, cfg.smax, nthreads);
     let stdout = std::io::stdout();
     let mut w = BufWriter::with_capacity(1 << 20, stdout.lock());
     if header {
@@ -269,6 +271,8 @@ OPTIONS:
                       score strand box_len larm larm_hamm spacer_len spacer rarm rarm_hamm seq
   --spacer <MIN-MAX>  flex spacer-length range in bp (default 3-15)
   --arm-tol <E>       flex per-arm substitution tolerance (default 1)
+  --max-arm-hd <H>    flex cap on TOTAL arm Hamming larm_hamm+rarm_hamm (default 2*E);
+                      e.g. --arm-tol 1 --max-arm-hd 1 keeps intact + single-arm-1-mut boxes
   --canonical <IUPAC> reference motif for Hamming scoring (same length as --motif)
   --arms <L,S>        arm cut points for decomposition: left=[0,L) spacer=[L,S) right=[S,len)
   --name <STR>        BED name column (default: the motif, or ECS for --cenpb)
@@ -299,6 +303,7 @@ fn main() {
     let mut flex = false;
     let mut spacer: Option<(usize, usize)> = None;
     let mut arm_tol: Option<u32> = None;
+    let mut max_arm_hd: Option<u32> = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -314,6 +319,7 @@ fn main() {
                 spacer = Some((v[0], v[1]));
             }
             "--arm-tol" => { i += 1; arm_tol = Some(argv.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())); }
+            "--max-arm-hd" => { i += 1; max_arm_hd = Some(argv.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())); }
             "--motif" => { i += 1; motif = Some(argv.get(i).cloned().unwrap_or_else(|| usage())); }
             "--canonical" => { i += 1; canonical = Some(argv.get(i).cloned().unwrap_or_else(|| usage())); }
             "--name" => { i += 1; name = Some(argv.get(i).cloned().unwrap_or_else(|| usage())); }
@@ -333,9 +339,10 @@ fn main() {
     if flex {
         let (smin, smax) = spacer.unwrap_or((3, 15));
         let e = arm_tol.unwrap_or(1);
+        let mhd = max_arm_hd.unwrap_or(2 * e); // default: no extra cap beyond per-arm tol
         let nm = name.clone().unwrap_or_else(|| "ECS".to_string());
         let fa = fasta.clone().unwrap_or_else(|| usage());
-        run_flex(&fa, FlexCfg { name: nm, e, smin, smax }, threads, header);
+        run_flex(&fa, FlexCfg { name: nm, e, smin, smax, max_arm_hd: mhd }, threads, header);
         return;
     }
 
@@ -458,7 +465,7 @@ mod tests {
     #[test]
     fn flex_perfect_box() {
         // canonical core-to-core: TTCG + TTGGAAA(7) + CGGG = 15 bp
-        let line = flex_emit("ECS", "c", 0, 15, true, b"TTCGTTGGAAACGGG").unwrap();
+        let line = flex_emit("ECS", "c", 0, 15, true, b"TTCGTTGGAAACGGG", 8).unwrap();
         let f: Vec<&str> = line.split('\t').collect();
         // chrom start end name score strand box_len larm larm_hamm spacer_len spacer rarm rarm_hamm seq
         assert_eq!(f[4], "1000");   // score (arms perfect)
@@ -473,7 +480,7 @@ mod tests {
     #[test]
     fn flex_short_spacer_and_arm_mut() {
         // 6-bp spacer (indel) + a left-arm mutation TTCG->TTGG
-        let line = flex_emit("ECS", "c", 0, 14, true, b"TTGGTTGAAACGGG").unwrap();
+        let line = flex_emit("ECS", "c", 0, 14, true, b"TTGGTTGAAACGGG", 8).unwrap();
         let f: Vec<&str> = line.split('\t').collect();
         assert_eq!(f[9], "6");      // spacer_len = 14 - 8
         assert_eq!(f[7], "TTGG");   // larm
@@ -485,12 +492,19 @@ mod tests {
     fn flex_minus_revcomp() {
         // revcomp(TTCGTTGGAAACGGG) on the fwd seq -> reported on - strand, canonical back
         let fwd = revcomp(b"TTCGTTGGAAACGGG");
-        let line = flex_emit("ECS", "c", 0, 15, false, &fwd).unwrap();
+        let line = flex_emit("ECS", "c", 0, 15, false, &fwd, 8).unwrap();
         let f: Vec<&str> = line.split('\t').collect();
         assert_eq!(f[5], "-");
         assert_eq!(f[13], "TTCGTTGGAAACGGG"); // canonical orientation
         assert_eq!(f[8], "0");
         assert_eq!(f[12], "0");
+    }
+
+    #[test]
+    fn flex_max_arm_hd_filters_both_mutated() {
+        // TTGG(larm 1mut) + TTGGAAA + CTGG(rarm 1mut) => total arm HD = 2
+        assert!(flex_emit("ECS", "c", 0, 15, true, b"TTGGTTGGAAACTGG", 1).is_none()); // capped at 1
+        assert!(flex_emit("ECS", "c", 0, 15, true, b"TTGGTTGGAAACTGG", 2).is_some()); // allowed at 2
     }
 
     #[test]

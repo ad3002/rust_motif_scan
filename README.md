@@ -44,7 +44,9 @@ The fixed `--cenpb` scan is a 17-bp window — substitutions only. `--cenpb-flex
 chrom start end name score strand box_len larm larm_hamm spacer_len spacer rarm rarm_hamm seq
 ```
 
-`box_len = 8 + spacer_len`; `larm_hamm`/`rarm_hamm` = substitutions in the left/right arm core (≤ arm-tol); `score = round((8−larm_hamm−rarm_hamm)/8 · 1000)`; `seq`/arms/spacer in canonical orientation. Answers e.g. "how many intact-arm boxes have a non-canonical spacer length?" (`larm_hamm=0 & rarm_hamm=0 & spacer_len≠7`) and the arm-mutation spectrum. Note: in low-complexity / repeat regions one left anchor can pair with several right anchors — aggregate (or take the nearest pair) downstream.
+`box_len = 8 + spacer_len`; `larm_hamm`/`rarm_hamm` = substitutions in the left/right arm core (≤ arm-tol); `score = round((8−larm_hamm−rarm_hamm)/8 · 1000)`; `seq`/arms/spacer in canonical orientation. Answers e.g. "how many intact-arm boxes have a non-canonical spacer length?" (`larm_hamm=0 & rarm_hamm=0 & spacer_len≠7`) and the arm-mutation spectrum.
+
+`--arm-tol 1` alone is permissive (both arms may carry a substitution → mostly composition noise). Use **`--max-arm-hd`** to cap the *total* arm Hamming: `--arm-tol 1 --max-arm-hd 1` keeps only **intact + single-arm-single-mutation** boxes (the clean, anchored set). Note: in low-complexity / repeat regions one left anchor can pair with several right anchors — aggregate (or take the nearest pair) downstream.
 
 ### Options
 
