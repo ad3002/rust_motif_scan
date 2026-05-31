@@ -1,6 +1,6 @@
 [package]
 name = "rust_motif_scan"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Aleksey Komissarov <ad3002@gmail.com>"]
 description = "Fast zero-dependency IUPAC degenerate-motif scanner (both strands, BED output) with a dedicated CENP-B box mode: left-arm / spacer / right-arm decomposition and Hamming-to-canonical integrity scoring."

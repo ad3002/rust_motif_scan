@@ -30,7 +30,21 @@ rust_motif_scan genome.fa --motif NTTCGNNNNANNCGGGN \
 
 # CENP-B box preset (the two lines above, built in)
 rust_motif_scan genome.fa --cenpb --header > ecs.bed
+
+# Edit-distance / two-anchor mode: TTCG ... <variable spacer> ... CGGG, each arm
+# allowing E substitutions — finds spacer-LENGTH variants the fixed scan misses
+rust_motif_scan genome.fa --cenpb-flex --spacer 3-15 --arm-tol 1 --header > boxes_flex.bed
 ```
+
+### `--cenpb-flex` (two-anchor, variable spacer)
+
+The fixed `--cenpb` scan is a 17-bp window — substitutions only. `--cenpb-flex` instead anchors on the two conserved arm cores `TTCG` … `CGGG` (each allowing `--arm-tol` substitutions) separated by a spacer of length `--spacer MIN-MAX`, so it also reports **spacer-length (indel) variants**. Columns:
+
+```
+chrom start end name score strand box_len larm larm_hamm spacer_len spacer rarm rarm_hamm seq
+```
+
+`box_len = 8 + spacer_len`; `larm_hamm`/`rarm_hamm` = substitutions in the left/right arm core (≤ arm-tol); `score = round((8−larm_hamm−rarm_hamm)/8 · 1000)`; `seq`/arms/spacer in canonical orientation. Answers e.g. "how many intact-arm boxes have a non-canonical spacer length?" (`larm_hamm=0 & rarm_hamm=0 & spacer_len≠7`) and the arm-mutation spectrum. Note: in low-complexity / repeat regions one left anchor can pair with several right anchors — aggregate (or take the nearest pair) downstream.
 
 ### Options
 
