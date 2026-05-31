@@ -1,0 +1,6 @@
+>seqA perfect canonical CENP-B box (+ strand) at 10
+AAAAAAAAAACTTCGTTGGAAACGGGAGGGGGGGGGG
+>seqB one mismatch in spacer (+ strand) at 5
+TTTTTCTTCGTTGCAAACGGGATTTTT
+>seqC canonical box on - strand (revcomp of perfect) at 6
+GGGGGGTCCCGTTTCCAACGAAGCCCCCC

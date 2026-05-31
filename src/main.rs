@@ -1,0 +1,339 @@
+//! rust_motif_scan — fast, zero-dependency IUPAC degenerate-motif scanner.
+//!
+//! Scans a FASTA for an IUPAC motif on BOTH strands and writes BED. With a
+//! `--canonical` reference (or the built-in `--cenpb` preset) it additionally
+//! scores each hit against a reference motif by Hamming distance, decomposed
+//! into left-arm / spacer / right-arm regions.
+//!
+//! Zero dependencies: builds with `cargo build --release` or even plain
+//! `rustc -O src/main.rs`. Multithreaded across FASTA records (std::thread).
+//!
+//! See README.md for the full column spec and the CENP-B box rationale.
+
+use std::env;
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::sync::Arc;
+use std::thread;
+use std::time::Instant;
+
+// ---- IUPAC / base masks (A=1,C=2,G=4,T=8) ----------------------------------
+
+/// IUPAC pattern char -> allowed-base mask.
+fn iupac_mask(b: u8) -> u8 {
+    match b.to_ascii_uppercase() {
+        b'A' => 1, b'C' => 2, b'G' => 4, b'T' => 8, b'U' => 8,
+        b'R' => 1 | 4, b'Y' => 2 | 8, b'S' => 2 | 4, b'W' => 1 | 8,
+        b'K' => 4 | 8, b'M' => 1 | 2,
+        b'B' => 2 | 4 | 8, b'D' => 1 | 4 | 8, b'H' => 1 | 2 | 8, b'V' => 1 | 2 | 4,
+        b'N' => 1 | 2 | 4 | 8,
+        _ => 0,
+    }
+}
+
+/// Genome base -> single-bit mask; anything not exactly A/C/G/T => 0 (no match).
+#[inline]
+fn genome_mask(b: u8) -> u8 {
+    match b { b'A' | b'a' => 1, b'C' | b'c' => 2, b'G' | b'g' => 4, b'T' | b't' => 8, _ => 0 }
+}
+
+#[inline]
+fn comp_mask(m: u8) -> u8 {
+    ((m & 1) << 3) | ((m & 8) >> 3) | ((m & 2) << 1) | ((m & 4) >> 1)
+}
+
+#[inline]
+fn revcomp(s: &[u8]) -> Vec<u8> {
+    s.iter().rev().map(|b| match b.to_ascii_uppercase() {
+        b'A' => b'T', b'T' => b'A', b'C' => b'G', b'G' => b'C', x => x,
+    }).collect()
+}
+
+// ---- FASTA -----------------------------------------------------------------
+
+struct Record { name: String, seq: Vec<u8> }
+
+fn read_fasta(path: &str) -> std::io::Result<Vec<Record>> {
+    let f = File::open(path)?;
+    let mut rdr = BufReader::with_capacity(1 << 20, f);
+    let mut recs = Vec::new();
+    let mut line = Vec::new();
+    let mut cur: Option<Record> = None;
+    loop {
+        line.clear();
+        if rdr.read_until(b'\n', &mut line)? == 0 { break; }
+        while matches!(line.last(), Some(b'\n') | Some(b'\r')) { line.pop(); }
+        if line.first() == Some(&b'>') {
+            if let Some(r) = cur.take() { recs.push(r); }
+            let hdr = &line[1..];
+            let end = hdr.iter().position(|c| *c == b' ' || *c == b'\t').unwrap_or(hdr.len());
+            cur = Some(Record { name: String::from_utf8_lossy(&hdr[..end]).into_owned(), seq: Vec::new() });
+        } else if let Some(r) = cur.as_mut() {
+            r.seq.extend_from_slice(&line);
+        }
+    }
+    if let Some(r) = cur.take() { recs.push(r); }
+    Ok(recs)
+}
+
+// ---- config ----------------------------------------------------------------
+
+struct Config {
+    name: String,
+    pat_fwd: Vec<u8>,
+    pat_rev: Vec<u8>,
+    /// canonical reference masks (same length as motif) for scoring, if any
+    canon: Option<Vec<u8>>,
+    /// (left_end, right_start) cut points for arm/spacer decomposition
+    arms: (usize, usize),
+}
+
+/// Score one hit window (forward genomic substring `win`) on the given strand.
+/// Returns the BED line (without trailing newline).
+fn format_hit(cfg: &Config, chrom: &str, start: usize, end: usize, plus: bool, win: &[u8]) -> String {
+    let l = cfg.pat_fwd.len();
+    // canonical-orientation sequence (5'->3' of the motif on its own strand)
+    let canon_seq: Vec<u8> = if plus {
+        win.iter().map(|b| b.to_ascii_uppercase()).collect()
+    } else {
+        revcomp(win)
+    };
+    let strand = if plus { '+' } else { '-' };
+    let seq = String::from_utf8_lossy(&canon_seq);
+
+    match &cfg.canon {
+        None => format!("{}\t{}\t{}\t{}\t0\t{}\t{}", chrom, start, end, cfg.name, strand, seq),
+        Some(cmask) => {
+            let (le, rs) = cfg.arms;
+            let (mut mis, mut hamm, mut hl, mut hr) = (0u32, 0u32, 0u32, 0u32);
+            for k in 0..l {
+                if genome_mask(canon_seq[k]) & cmask[k] != 0 {
+                    mis += 1;
+                } else {
+                    hamm += 1;
+                    if k < le { hl += 1; } else if k >= rs { hr += 1; }
+                }
+            }
+            let score = (mis as usize * 1000 / l) as u32;
+            let larm = &seq[0..le];
+            let spacer = &seq[le..rs];
+            let rarm = &seq[rs..l];
+            format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                chrom, start, end, cfg.name, score, strand,
+                mis, hamm, hl, hr, seq, larm, spacer, rarm)
+        }
+    }
+}
+
+fn scan_record(rec: &Record, cfg: &Config, out: &mut String) -> (u64, u64) {
+    let l = cfg.pat_fwd.len();
+    let s = &rec.seq;
+    if s.len() < l { return (0, 0); }
+    let gm: Vec<u8> = s.iter().map(|b| genome_mask(*b)).collect();
+    let (mut fwd, mut rev) = (0u64, 0u64);
+    let last = s.len() - l;
+    for i in 0..=last {
+        let mut okf = true;
+        for k in 0..l { if gm[i + k] & cfg.pat_fwd[k] == 0 { okf = false; break; } }
+        if okf { fwd += 1; out.push_str(&format_hit(cfg, &rec.name, i, i + l, true, &s[i..i + l])); out.push('\n'); }
+        let mut okr = true;
+        for k in 0..l { if gm[i + k] & cfg.pat_rev[k] == 0 { okr = false; break; } }
+        if okr { rev += 1; out.push_str(&format_hit(cfg, &rec.name, i, i + l, false, &s[i..i + l])); out.push('\n'); }
+    }
+    (fwd, rev)
+}
+
+// ---- CLI -------------------------------------------------------------------
+
+const CENPB_MOTIF: &str = "NTTCGNNNNANNCGGGN";
+const CENPB_CANON: &str = "YTTCGTTGGAARCGGGA";
+
+fn usage() -> ! {
+    eprintln!(
+"rust_motif_scan — IUPAC motif scanner (both strands), BED output.
+
+USAGE:
+  rust_motif_scan <fasta> --motif <IUPAC> [options]
+  rust_motif_scan <fasta> --cenpb [options]
+
+OPTIONS:
+  --motif <IUPAC>     search pattern (IUPAC; scans both strands)
+  --cenpb             preset: --motif {m} --canonical {c} --arms 5,12 --name ECS
+  --canonical <IUPAC> reference motif for Hamming scoring (same length as --motif)
+  --arms <L,S>        arm cut points for decomposition: left=[0,L) spacer=[L,S) right=[S,len)
+  --name <STR>        BED name column (default: the motif, or ECS for --cenpb)
+  --threads <N>       worker threads (default: all cores)
+  --header            print a #-prefixed column header line
+  -h, --help          this help
+
+OUTPUT (BED, tab-separated):
+  plain:           chrom start end name 0 strand seq
+  with --canonical: chrom start end name score strand mis hamm hammL hammR seq larm spacer rarm
+    score = round(mis/len*1000); mis/hamm = IUPAC-aware matches/mismatches to canonical;
+    hammL/hammR = mismatches within the left/right arm; seq = canonical orientation (revcomp if -).",
+        m = CENPB_MOTIF, c = CENPB_CANON);
+    std::process::exit(2);
+}
+
+fn main() {
+    let argv: Vec<String> = env::args().collect();
+    if argv.len() < 2 { usage(); }
+    let mut fasta: Option<String> = None;
+    let mut motif: Option<String> = None;
+    let mut canonical: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut arms: Option<(usize, usize)> = None;
+    let mut threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let mut header = false;
+    let mut cenpb = false;
+
+    let mut i = 1;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "-h" | "--help" => usage(),
+            "--cenpb" => cenpb = true,
+            "--header" => header = true,
+            "--motif" => { i += 1; motif = Some(argv.get(i).cloned().unwrap_or_else(|| usage())); }
+            "--canonical" => { i += 1; canonical = Some(argv.get(i).cloned().unwrap_or_else(|| usage())); }
+            "--name" => { i += 1; name = Some(argv.get(i).cloned().unwrap_or_else(|| usage())); }
+            "--threads" => { i += 1; threads = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()); }
+            "--arms" => {
+                i += 1;
+                let v: Vec<usize> = argv.get(i).unwrap_or_else(|| usage()).split(',').filter_map(|s| s.parse().ok()).collect();
+                if v.len() != 2 { usage(); }
+                arms = Some((v[0], v[1]));
+            }
+            s if !s.starts_with('-') && fasta.is_none() => fasta = Some(s.to_string()),
+            _ => { eprintln!("unknown arg: {}", argv[i]); usage(); }
+        }
+        i += 1;
+    }
+
+    if cenpb {
+        motif.get_or_insert_with(|| CENPB_MOTIF.to_string());
+        canonical.get_or_insert_with(|| CENPB_CANON.to_string());
+        arms.get_or_insert((5, 12));
+        name.get_or_insert_with(|| "ECS".to_string());
+    }
+
+    let fasta = fasta.unwrap_or_else(|| usage());
+    let motif = motif.unwrap_or_else(|| { eprintln!("error: --motif or --cenpb required"); usage(); });
+    let mname = name.unwrap_or_else(|| motif.clone());
+
+    let pat_fwd: Vec<u8> = motif.bytes().map(iupac_mask).collect();
+    if pat_fwd.iter().any(|m| *m == 0) { eprintln!("error: --motif has a non-IUPAC char"); std::process::exit(2); }
+    let pat_rev: Vec<u8> = pat_fwd.iter().rev().map(|m| comp_mask(*m)).collect();
+
+    let canon = match &canonical {
+        None => None,
+        Some(c) => {
+            if c.len() != motif.len() { eprintln!("error: --canonical len {} != --motif len {}", c.len(), motif.len()); std::process::exit(2); }
+            let cm: Vec<u8> = c.bytes().map(iupac_mask).collect();
+            if cm.iter().any(|m| *m == 0) { eprintln!("error: --canonical has a non-IUPAC char"); std::process::exit(2); }
+            Some(cm)
+        }
+    };
+    let arms = arms.unwrap_or((0, motif.len())); // no decomposition unless set
+
+    let cfg = Arc::new(Config { name: mname, pat_fwd, pat_rev, canon, arms });
+
+    let t0 = Instant::now();
+    let recs = Arc::new(read_fasta(&fasta).unwrap_or_else(|e| { eprintln!("read error: {e}"); std::process::exit(1); }));
+    let n = recs.len();
+    let nthreads = threads.max(1).min(n.max(1));
+    eprintln!("loaded {} records ({} bp); motif {} ({}) on {} threads",
+        n, recs.iter().map(|r| r.seq.len()).sum::<usize>(), motif,
+        if cfg.canon.is_some() { "scored" } else { "plain" }, nthreads);
+
+    let stdout = std::io::stdout();
+    let mut w = BufWriter::with_capacity(1 << 20, stdout.lock());
+    if header {
+        if cfg.canon.is_some() {
+            writeln!(w, "#chrom\tstart\tend\tname\tscore\tstrand\tmis\thamm\thammL\thammR\tseq\tlarm\tspacer\trarm").unwrap();
+        } else {
+            writeln!(w, "#chrom\tstart\tend\tname\tscore\tstrand\tseq").unwrap();
+        }
+    }
+
+    let mut handles = Vec::new();
+    for t in 0..nthreads {
+        let recs = Arc::clone(&recs); let cfg = Arc::clone(&cfg);
+        handles.push(thread::spawn(move || {
+            let mut buf = String::new(); let (mut f, mut r) = (0u64, 0u64);
+            let mut idx = t;
+            while idx < recs.len() { let (a, b) = scan_record(&recs[idx], &cfg, &mut buf); f += a; r += b; idx += nthreads; }
+            (buf, f, r)
+        }));
+    }
+    let (mut tf, mut tr) = (0u64, 0u64);
+    for h in handles { let (buf, f, r) = h.join().unwrap(); w.write_all(buf.as_bytes()).unwrap(); tf += f; tr += r; }
+    w.flush().unwrap();
+    eprintln!("DONE motif={} total={} fwd={} rev={} elapsed={:.2}s", motif, tf + tr, tf, tr, t0.elapsed().as_secs_f64());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cenpb_cfg() -> Config {
+        let pat_fwd: Vec<u8> = CENPB_MOTIF.bytes().map(iupac_mask).collect();
+        let pat_rev: Vec<u8> = pat_fwd.iter().rev().map(|m| comp_mask(*m)).collect();
+        let canon: Vec<u8> = CENPB_CANON.bytes().map(iupac_mask).collect();
+        Config { name: "ECS".into(), pat_fwd, pat_rev, canon: Some(canon), arms: (5, 12) }
+    }
+
+    #[test]
+    fn revcomp_canonical() {
+        assert_eq!(revcomp(b"CTTCGTTGGAAACGGGA"), b"TCCCGTTTCCAACGAAG".to_vec());
+    }
+
+    #[test]
+    fn comp_mask_roundtrip() {
+        for c in [b'A', b'C', b'G', b'T', b'R', b'Y', b'N'] {
+            let m = iupac_mask(c);
+            assert_eq!(comp_mask(comp_mask(m)), m);
+        }
+    }
+
+    #[test]
+    fn perfect_plus_hit() {
+        let cfg = cenpb_cfg();
+        let line = format_hit(&cfg, "chr1", 10, 27, true, b"CTTCGTTGGAAACGGGA");
+        let f: Vec<&str> = line.split('\t').collect();
+        // chrom start end name score strand mis hamm hammL hammR seq larm spacer rarm
+        assert_eq!(f[0], "chr1");
+        assert_eq!(f[4], "1000");          // score = 17/17*1000
+        assert_eq!(f[5], "+");
+        assert_eq!(f[6], "17");            // mis
+        assert_eq!(f[7], "0");             // hamm
+        assert_eq!(f[8], "0");             // hammL
+        assert_eq!(f[9], "0");             // hammR
+        assert_eq!(f[10], "CTTCGTTGGAAACGGGA");
+        assert_eq!(f[11], "CTTCG");        // larm [0,5)
+        assert_eq!(f[12], "TTGGAAA");      // spacer [5,12)
+        assert_eq!(f[13], "CGGGA");        // rarm [12,17)
+    }
+
+    #[test]
+    fn minus_hit_is_revcomp() {
+        let cfg = cenpb_cfg();
+        // forward window = revcomp of the perfect box -> reported on - strand, seq back to canonical
+        let line = format_hit(&cfg, "chr1", 0, 17, false, b"TCCCGTTTCCAACGAAG");
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f[5], "-");
+        assert_eq!(f[6], "17");            // mis = perfect
+        assert_eq!(f[10], "CTTCGTTGGAAACGGGA");
+    }
+
+    #[test]
+    fn spacer_mismatch_scored() {
+        let cfg = cenpb_cfg();
+        // pos9 G->C mismatch (inside spacer)
+        let line = format_hit(&cfg, "c", 0, 17, true, b"CTTCGTTGCAAACGGGA");
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f[6], "16");            // mis
+        assert_eq!(f[7], "1");             // hamm
+        assert_eq!(f[8], "0");             // hammL (arm intact)
+        assert_eq!(f[9], "0");             // hammR (arm intact)
+    }
+}
