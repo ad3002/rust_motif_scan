@@ -351,6 +351,48 @@ fn run_chain_match(a: &str, b: &str, k: usize, bucket: usize, min_shared: usize,
         ba.len(), bb.len(), k, bucket, max_gram_freq, dropped, total, min_shared);
 }
 
+/// Liftover-free conservation: for each reference chain k-gram, count how many
+/// query genomes contain it. Output BED: contig start end cons_count. The
+/// reference position lets downstream stratify by repeat/chromatin/position axis.
+fn run_chain_conservation(ref_path: &str, query_list: &str, k: usize, bucket: usize) {
+    let refb = load_boxes(ref_path);
+    // reference gram instances with genomic position (start of the window's first box)
+    let mut ref_pos: Vec<(String, usize, usize)> = Vec::new(); // contig, start, end
+    let mut ref_gram: Vec<Vec<u64>> = Vec::new();
+    let mut contigs: Vec<&String> = refb.keys().collect(); contigs.sort();
+    for contig in contigs {
+        let v = &refb[contig];
+        if v.len() < k { continue; }
+        let syms: Vec<u64> = (0..v.len() - 1).map(|i| elem_sym(v, i, bucket)).collect();
+        let w = k - 1;
+        for i in 0..=syms.len() - w {
+            ref_pos.push((contig.clone(), v[i].0, v[i + w].0));
+            ref_gram.push(syms[i..i + w].to_vec());
+        }
+    }
+    let mut cons = vec![0u32; ref_gram.len()];
+    // load query list
+    let ql = std::fs::read_to_string(query_list).unwrap_or_else(|e| { eprintln!("query list {query_list}: {e}"); std::process::exit(1); });
+    let queries: Vec<&str> = ql.lines().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let nq = queries.len();
+    eprintln!("ref grams={} queries={} k={} bucket={}", ref_gram.len(), nq, k, bucket);
+    for (qi, q) in queries.iter().enumerate() {
+        let qb = load_boxes(q);
+        let mut qset: std::collections::HashSet<Vec<u64>> = std::collections::HashSet::new();
+        for (_, v) in &qb { for g in elem_kgrams(v, k, bucket) { qset.insert(g); } }
+        for (idx, g) in ref_gram.iter().enumerate() { if qset.contains(g) { cons[idx] += 1; } }
+        if (qi + 1) % 50 == 0 { eprintln!("  {}/{} queries", qi + 1, nq); }
+    }
+    let stdout = std::io::stdout();
+    let mut wtr = BufWriter::with_capacity(1 << 20, stdout.lock());
+    writeln!(wtr, "#contig\tstart\tend\tcons_count\tn_query").unwrap();
+    for (i, (c, s, e)) in ref_pos.iter().enumerate() {
+        writeln!(wtr, "{}\t{}\t{}\t{}\t{}", c, s, e, cons[i], nq).unwrap();
+    }
+    wtr.flush().unwrap();
+    eprintln!("DONE chain-conservation: {} ref grams scored over {} queries", ref_gram.len(), nq);
+}
+
 // ---- CLI -------------------------------------------------------------------
 
 const CENPB_MOTIF: &str = "NTTCGNNNNANNCGGGN";
@@ -418,6 +460,22 @@ fn main() {
                 i += 1;
             }
             run_chain_match(&a, &b, k.max(2), bucket.max(1), min_shared.max(1), max_gram_freq.max(1));
+            return;
+        }
+        "chain-conservation" => {
+            let r = argv.get(2).cloned().unwrap_or_else(|| usage());
+            let ql = argv.get(3).cloned().unwrap_or_else(|| usage());
+            let (mut k, mut bucket) = (11usize, 5usize);
+            let mut i = 4;
+            while i < argv.len() {
+                match argv[i].as_str() {
+                    "--k" => { i += 1; k = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(11); }
+                    "--bucket" => { i += 1; bucket = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(5); }
+                    _ => {}
+                }
+                i += 1;
+            }
+            run_chain_conservation(&r, &ql, k.max(2), bucket.max(1));
             return;
         }
         _ => {}
