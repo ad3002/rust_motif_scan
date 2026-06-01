@@ -90,6 +90,18 @@ Because the search fixes the 9 docking nucleotides, the **arms come out conserve
 
 > Note: the raw genome-wide count of `NTTCGNNNNANNCGGGN` (~166 k in CHM13) is dominated by centromeric α-satellite. "Ectocentromeric sites" (chromosome-arm occurrences) are a downstream subset obtained by excluding centromeric regions — apply your own region filter to `ecs.bed`.
 
+## Box chains (optical-map-style, experimental)
+
+Treat boxes as ordered **landmarks** along each contig (like restriction sites in optical mapping) and compare genomes by **chain**, not by coordinate liftover — robust to chromosomal rearrangements.
+
+```bash
+rust_motif_scan chains  boxes.cenpb.bed                 # per-contig chain: start strand integ dist_next
+rust_motif_scan chain-match A.cenpb.bed B.cenpb.bed \   # find homologous chains by shared distance k-grams
+    --k 17 --bucket 5 --min-shared 1
+```
+
+`chains` emits, per contig, each box's `start`, `strand`, integrity class (`C`=canonical mis≥17, `N`=near 15–16, `d`=degenerate), and the distance to the next box. `chain-match` (prototype) seeds on **k-grams of bucketed inter-box distances** (generalizes GCP-Centeny `model3`) — two contigs sharing distance-patterns are candidate homologs, found without absolute coordinates. The production affine optical-map aligner (handling box indels/sizing error) is a separate step. Gzipped box BEDs: `zcat boxes.bed.gz | rust_motif_scan chains /dev/stdin`.
+
 ## Semantics & correctness
 
 - A genome base matches only if it is exactly `A/C/G/T`; any other byte (`N`, gap, IUPAC ambiguity in the genome) matches nothing, so **no hit is ever called across an assembly gap**.

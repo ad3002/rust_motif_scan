@@ -248,6 +248,95 @@ fn run_flex(fasta: &str, cfg: FlexCfg, threads: usize, header: bool) {
     eprintln!("DONE cenpb-flex total={} fwd={} rev={} elapsed={:.2}s", tf + tr, tf, tr, t0.elapsed().as_secs_f64());
 }
 
+// ---- chains: box landmarks -> per-contig chains, optical-map-style match -----
+//
+// Treats CENP-B boxes as ordered landmarks along each contig (like restriction
+// sites in optical mapping). A chain element = (inter-box distance, orientation,
+// integrity class). Cross-genome conservation is then a CHAIN match, NOT a
+// coordinate liftover — robust to rearrangements. `chain-match` here is a
+// PROTOTYPE: bucketed-distance k-gram seeding (generalizes GCP-Centeny model3);
+// the production affine optical-map aligner is alphasplitter's align_and_cigar.
+
+use std::collections::HashMap;
+
+fn integ_class(mis: u32) -> char { if mis >= 17 { 'C' } else if mis >= 15 { 'N' } else { 'd' } }
+
+/// Read a --cenpb box BED (path or /dev/stdin) -> contig -> sorted [(start,strand,mis)].
+fn load_boxes(path: &str) -> HashMap<String, Vec<(usize, char, u32)>> {
+    let f = File::open(path).unwrap_or_else(|e| { eprintln!("open {path}: {e}"); std::process::exit(1); });
+    let mut rdr = BufReader::with_capacity(1 << 20, f);
+    let mut by: HashMap<String, Vec<(usize, char, u32)>> = HashMap::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if rdr.read_line(&mut line).unwrap_or(0) == 0 { break; }
+        let t = line.trim_end();
+        if t.is_empty() || t.starts_with('#') { continue; }
+        let c: Vec<&str> = t.split('\t').collect();
+        if c.len() < 7 { continue; }
+        let (start, strand, mis) = match (c[1].parse::<usize>(), c[5].chars().next(), c[6].parse::<u32>()) {
+            (Ok(s), Some(st), Ok(m)) => (s, st, m), _ => continue,
+        };
+        by.entry(c[0].to_string()).or_default().push((start, strand, mis));
+    }
+    for v in by.values_mut() { v.sort_by_key(|x| x.0); }
+    by
+}
+
+fn run_chains(path: &str) {
+    let by = load_boxes(path);
+    let stdout = std::io::stdout();
+    let mut w = BufWriter::with_capacity(1 << 20, stdout.lock());
+    writeln!(w, "#contig\tidx\tstart\tstrand\tinteg\tdist_next").unwrap();
+    let mut contigs: Vec<&String> = by.keys().collect();
+    contigs.sort();
+    for contig in contigs {
+        let v = &by[contig];
+        for i in 0..v.len() {
+            let dist_next: i64 = if i + 1 < v.len() { (v[i + 1].0 - v[i].0) as i64 } else { -1 };
+            writeln!(w, "{}\t{}\t{}\t{}\t{}\t{}", contig, i, v[i].0, v[i].1, integ_class(v[i].2), dist_next).unwrap();
+        }
+    }
+    w.flush().unwrap();
+    eprintln!("chains: {} contigs", by.len());
+}
+
+/// k-grams of bucketed inter-box distances for one contig's boxes.
+fn dist_kgrams(v: &[(usize, char, u32)], k: usize, bucket: usize) -> Vec<Vec<u32>> {
+    if v.len() < k { return Vec::new(); }
+    let dists: Vec<u32> = (0..v.len() - 1).map(|i| (((v[i + 1].0 - v[i].0) / bucket) as u32)).collect();
+    if dists.len() < k - 1 { return Vec::new(); }
+    (0..=dists.len() - (k - 1)).map(|i| dists[i..i + (k - 1)].to_vec()).collect()
+}
+
+fn run_chain_match(a: &str, b: &str, k: usize, bucket: usize, min_shared: usize) {
+    let ba = load_boxes(a);
+    let bb = load_boxes(b);
+    // index B's k-grams: hashed gram -> set of contigs
+    let mut idx: HashMap<Vec<u32>, Vec<String>> = HashMap::new();
+    for (contig, v) in &bb {
+        for g in dist_kgrams(v, k, bucket) { idx.entry(g).or_default().push(contig.clone()); }
+    }
+    // for each A contig, count shared grams per B contig
+    let stdout = std::io::stdout();
+    let mut w = BufWriter::new(stdout.lock());
+    writeln!(w, "#contigA\tcontigB\tshared_kgrams").unwrap();
+    let mut total = 0u64;
+    let mut contigs: Vec<&String> = ba.keys().collect(); contigs.sort();
+    for ca in contigs {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for g in dist_kgrams(&ba[ca], k, bucket) {
+            if let Some(cbs) = idx.get(&g) { for cb in cbs { *counts.entry(cb.as_str()).or_default() += 1; } }
+        }
+        let mut hits: Vec<(&str, usize)> = counts.into_iter().filter(|x| x.1 >= min_shared).collect();
+        hits.sort_by(|x, y| y.1.cmp(&x.1));
+        for (cb, n) in hits.into_iter().take(5) { writeln!(w, "{}\t{}\t{}", ca, cb, n).unwrap(); total += 1; }
+    }
+    w.flush().unwrap();
+    eprintln!("chain-match: A={} contigs B={} contigs k={} bucket={} -> {} matched pairs (>= {} shared)",
+        ba.len(), bb.len(), k, bucket, total, min_shared);
+}
+
 // ---- CLI -------------------------------------------------------------------
 
 const CENPB_MOTIF: &str = "NTTCGNNNNANNCGGGN";
@@ -261,6 +350,9 @@ USAGE:
   rust_motif_scan <fasta> --motif <IUPAC> [options]
   rust_motif_scan <fasta> --cenpb [options]
   rust_motif_scan <fasta> --cenpb-flex [--spacer MIN-MAX] [--arm-tol E] [options]
+  rust_motif_scan chains <boxes.cenpb.bed>            # box BED -> per-contig chains
+  rust_motif_scan chain-match <A.bed> <B.bed> [--k 17] [--bucket 5] [--min-shared 1]
+                                                     # optical-map-style k-gram chain match (prototype)
 
 OPTIONS:
   --motif <IUPAC>     search pattern (IUPAC; scans both strands)
@@ -292,6 +384,30 @@ OUTPUT (BED, tab-separated):
 fn main() {
     let argv: Vec<String> = env::args().collect();
     if argv.len() < 2 { usage(); }
+
+    // chain subcommands (input is a --cenpb box BED, not a FASTA)
+    match argv[1].as_str() {
+        "chains" => { run_chains(&argv.get(2).cloned().unwrap_or_else(|| usage())); return; }
+        "chain-match" => {
+            let a = argv.get(2).cloned().unwrap_or_else(|| usage());
+            let b = argv.get(3).cloned().unwrap_or_else(|| usage());
+            let (mut k, mut bucket, mut min_shared) = (17usize, 5usize, 1usize);
+            let mut i = 4;
+            while i < argv.len() {
+                match argv[i].as_str() {
+                    "--k" => { i += 1; k = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(17); }
+                    "--bucket" => { i += 1; bucket = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(5); }
+                    "--min-shared" => { i += 1; min_shared = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(1); }
+                    _ => {}
+                }
+                i += 1;
+            }
+            run_chain_match(&a, &b, k.max(2), bucket.max(1), min_shared.max(1));
+            return;
+        }
+        _ => {}
+    }
+
     let mut fasta: Option<String> = None;
     let mut motif: Option<String> = None;
     let mut canonical: Option<String> = None;
@@ -505,6 +621,19 @@ mod tests {
         // TTGG(larm 1mut) + TTGGAAA + CTGG(rarm 1mut) => total arm HD = 2
         assert!(flex_emit("ECS", "c", 0, 15, true, b"TTGGTTGGAAACTGG", 1).is_none()); // capped at 1
         assert!(flex_emit("ECS", "c", 0, 15, true, b"TTGGTTGGAAACTGG", 2).is_some()); // allowed at 2
+    }
+
+    #[test]
+    fn chain_kgrams_and_class() {
+        assert_eq!(integ_class(17), 'C');
+        assert_eq!(integ_class(15), 'N');
+        assert_eq!(integ_class(10), 'd');
+        // boxes at 0,100,205,300 -> dists 100,105,95 -> bucket 5 -> 20,21,19
+        let v = vec![(0usize, '+', 17u32), (100, '+', 17), (205, '-', 16), (300, '+', 14)];
+        let g = dist_kgrams(&v, 3, 5); // k=3 -> 2-distance grams
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0], vec![20, 21]);
+        assert_eq!(g[1], vec![21, 19]);
     }
 
     #[test]
