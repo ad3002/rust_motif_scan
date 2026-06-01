@@ -301,23 +301,37 @@ fn run_chains(path: &str) {
     eprintln!("chains: {} contigs", by.len());
 }
 
-/// k-grams of bucketed inter-box distances for one contig's boxes.
-fn dist_kgrams(v: &[(usize, char, u32)], k: usize, bucket: usize) -> Vec<Vec<u32>> {
-    if v.len() < k { return Vec::new(); }
-    let dists: Vec<u32> = (0..v.len() - 1).map(|i| (((v[i + 1].0 - v[i].0) / bucket) as u32)).collect();
-    if dists.len() < k - 1 { return Vec::new(); }
-    (0..=dists.len() - (k - 1)).map(|i| dists[i..i + (k - 1)].to_vec()).collect()
+/// Per-box symbol packing (bucketed dist-to-next, strand, integrity) — the user's
+/// 3-part chain element. Distance ALONE is non-specific in tandem arrays (periodic
+/// spacing); strand + integrity break the symmetry.
+#[inline]
+fn elem_sym(v: &[(usize, char, u32)], i: usize, bucket: usize) -> u64 {
+    let d = ((v[i + 1].0 - v[i].0) / bucket) as u64;
+    let s = if v[i].1 == '-' { 1u64 } else { 0 };
+    let ig = match integ_class(v[i].2) { 'C' => 0u64, 'N' => 1, _ => 2 };
+    d * 8 + s * 4 + ig
 }
 
-fn run_chain_match(a: &str, b: &str, k: usize, bucket: usize, min_shared: usize) {
+/// k-grams over (k-1) consecutive 3-part symbols.
+fn elem_kgrams(v: &[(usize, char, u32)], k: usize, bucket: usize) -> Vec<Vec<u64>> {
+    if v.len() < k { return Vec::new(); }
+    let syms: Vec<u64> = (0..v.len() - 1).map(|i| elem_sym(v, i, bucket)).collect();
+    let w = k - 1;
+    if syms.len() < w { return Vec::new(); }
+    (0..=syms.len() - w).map(|i| syms[i..i + w].to_vec()).collect()
+}
+
+fn run_chain_match(a: &str, b: &str, k: usize, bucket: usize, min_shared: usize, max_gram_freq: usize) {
     let ba = load_boxes(a);
     let bb = load_boxes(b);
-    // index B's k-grams: hashed gram -> set of contigs
-    let mut idx: HashMap<Vec<u32>, Vec<String>> = HashMap::new();
+    // index B's k-grams (occurrence list per gram)
+    let mut idx: HashMap<Vec<u64>, Vec<String>> = HashMap::new();
     for (contig, v) in &bb {
-        for g in dist_kgrams(v, k, bucket) { idx.entry(g).or_default().push(contig.clone()); }
+        for g in elem_kgrams(v, k, bucket) { idx.entry(g).or_default().push(contig.clone()); }
     }
-    // for each A contig, count shared grams per B contig
+    // drop non-specific (repetitive) grams that occur in too many places
+    let dropped = idx.iter().filter(|(_, c)| c.len() > max_gram_freq).count();
+    idx.retain(|_, c| c.len() <= max_gram_freq);
     let stdout = std::io::stdout();
     let mut w = BufWriter::new(stdout.lock());
     writeln!(w, "#contigA\tcontigB\tshared_kgrams").unwrap();
@@ -325,7 +339,7 @@ fn run_chain_match(a: &str, b: &str, k: usize, bucket: usize, min_shared: usize)
     let mut contigs: Vec<&String> = ba.keys().collect(); contigs.sort();
     for ca in contigs {
         let mut counts: HashMap<&str, usize> = HashMap::new();
-        for g in dist_kgrams(&ba[ca], k, bucket) {
+        for g in elem_kgrams(&ba[ca], k, bucket) {
             if let Some(cbs) = idx.get(&g) { for cb in cbs { *counts.entry(cb.as_str()).or_default() += 1; } }
         }
         let mut hits: Vec<(&str, usize)> = counts.into_iter().filter(|x| x.1 >= min_shared).collect();
@@ -333,8 +347,8 @@ fn run_chain_match(a: &str, b: &str, k: usize, bucket: usize, min_shared: usize)
         for (cb, n) in hits.into_iter().take(5) { writeln!(w, "{}\t{}\t{}", ca, cb, n).unwrap(); total += 1; }
     }
     w.flush().unwrap();
-    eprintln!("chain-match: A={} contigs B={} contigs k={} bucket={} -> {} matched pairs (>= {} shared)",
-        ba.len(), bb.len(), k, bucket, total, min_shared);
+    eprintln!("chain-match: A={} B={} contigs k={} bucket={} max_gram_freq={} (dropped {} repetitive grams) -> {} pairs (>= {} shared)",
+        ba.len(), bb.len(), k, bucket, max_gram_freq, dropped, total, min_shared);
 }
 
 // ---- CLI -------------------------------------------------------------------
@@ -391,18 +405,19 @@ fn main() {
         "chain-match" => {
             let a = argv.get(2).cloned().unwrap_or_else(|| usage());
             let b = argv.get(3).cloned().unwrap_or_else(|| usage());
-            let (mut k, mut bucket, mut min_shared) = (17usize, 5usize, 1usize);
+            let (mut k, mut bucket, mut min_shared, mut max_gram_freq) = (17usize, 5usize, 1usize, 50usize);
             let mut i = 4;
             while i < argv.len() {
                 match argv[i].as_str() {
                     "--k" => { i += 1; k = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(17); }
                     "--bucket" => { i += 1; bucket = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(5); }
                     "--min-shared" => { i += 1; min_shared = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(1); }
+                    "--max-gram-freq" => { i += 1; max_gram_freq = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(50); }
                     _ => {}
                 }
                 i += 1;
             }
-            run_chain_match(&a, &b, k.max(2), bucket.max(1), min_shared.max(1));
+            run_chain_match(&a, &b, k.max(2), bucket.max(1), min_shared.max(1), max_gram_freq.max(1));
             return;
         }
         _ => {}
@@ -628,12 +643,13 @@ mod tests {
         assert_eq!(integ_class(17), 'C');
         assert_eq!(integ_class(15), 'N');
         assert_eq!(integ_class(10), 'd');
-        // boxes at 0,100,205,300 -> dists 100,105,95 -> bucket 5 -> 20,21,19
+        // boxes at 0,100,205,300; bucket 5; symbol = dist*8 + strand*4 + integ
+        // sym0 d20,+,C=160; sym1 d21,+,C=168; sym2 d19,-,N=157
         let v = vec![(0usize, '+', 17u32), (100, '+', 17), (205, '-', 16), (300, '+', 14)];
-        let g = dist_kgrams(&v, 3, 5); // k=3 -> 2-distance grams
+        let g = elem_kgrams(&v, 3, 5); // k=3 -> 2-symbol grams
         assert_eq!(g.len(), 2);
-        assert_eq!(g[0], vec![20, 21]);
-        assert_eq!(g[1], vec![21, 19]);
+        assert_eq!(g[0], vec![160, 168]);
+        assert_eq!(g[1], vec![168, 157]);
     }
 
     #[test]
